@@ -1,0 +1,8 @@
+node_modules
+.env
+.gocache
+.gomodcache
+dist
+deploy
+*.zip
+*.exe
