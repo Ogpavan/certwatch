@@ -8,8 +8,7 @@ import {
   Avatar,
   Dropdown,
   Space,
-  Button,
-  message
+  Button
 } from "antd";
 import {
   DashboardOutlined,
@@ -23,7 +22,6 @@ import {
   MenuFoldOutlined,
   MenuUnfoldOutlined
 } from "@ant-design/icons";
-import { clearToken } from "../services/api.js";
 
 const { Header, Sider, Content } = Layout;
 
@@ -73,15 +71,9 @@ export default function AppLayout() {
   const userMenu = {
     items: [
       { key: "profile", label: "Profile" },
-      { key: "settings", label: "Settings" },
-      { key: "logout", label: "Logout" }
+      { key: "settings", label: "Settings" }
     ],
     onClick: ({ key }) => {
-      if (key === "logout") {
-        clearToken();
-        message.success("Logged out");
-        navigate("/login");
-      }
       if (key === "settings") {
         navigate("/settings");
       }

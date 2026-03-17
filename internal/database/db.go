@@ -191,6 +191,45 @@ func EnsureTables(db *sql.DB) error {
 	return nil
 }
 
+func EnsureDefaultUser(db *sql.DB) (int, error) {
+	var userID int
+	err := db.QueryRow("SELECT TOP 1 id FROM users ORDER BY id").Scan(&userID)
+	if err == nil && userID > 0 {
+		if err := ensureNotificationSettings(db, userID); err != nil {
+			return userID, err
+		}
+		return userID, nil
+	}
+	if err != nil && err != sql.ErrNoRows {
+		return 0, err
+	}
+
+	err = db.QueryRow(
+		"INSERT INTO users (email, password_hash) OUTPUT INSERTED.id VALUES (@p1, @p2)",
+		"local@localhost", "disabled",
+	).Scan(&userID)
+	if err != nil {
+		return 0, err
+	}
+	if err := ensureNotificationSettings(db, userID); err != nil {
+		return userID, err
+	}
+	return userID, nil
+}
+
+func ensureNotificationSettings(db *sql.DB, userID int) error {
+	if userID <= 0 {
+		return nil
+	}
+	_, err := db.Exec(
+		`IF NOT EXISTS (SELECT 1 FROM dbo.user_notification_settings WHERE user_id=@p1)
+		 INSERT INTO dbo.user_notification_settings (user_id, email_enabled, email_recipients, notify_days, schedule_time)
+		 VALUES (@p1, 1, '[]', '["30","14","7","3"]', '03:00')`,
+		userID,
+	)
+	return err
+}
+
 func withDatabase(connString, dbName string) string {
 	parts := strings.Split(connString, ";")
 	cleaned := make([]string, 0, len(parts))

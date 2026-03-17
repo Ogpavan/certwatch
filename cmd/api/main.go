@@ -16,6 +16,9 @@ import (
 )
 
 func main() {
+	if loc, err := time.LoadLocation("Asia/Kolkata"); err == nil {
+		time.Local = loc
+	}
 	appconfig.LoadEnv(".env")
 	cfg := appconfig.LoadAppConfig()
 
@@ -40,18 +43,18 @@ func main() {
 
 	gin.SetMode(gin.ReleaseMode)
 	router := api.NewRouter(db, nil, api.Config{
-		JWTSecret:       cfg.JWTSecret,
-		TokenTTL:        cfg.TokenTTL,
-		WorkerAPIURL:    cfg.WorkerAPIURL,
-		WorkerAPIToken:  cfg.WorkerAPIToken,
-		WorkerTimeout:   time.Duration(cfg.WorkerTimeoutSecs) * time.Second,
-		DefaultUserID:   defaultUserID,
+		JWTSecret:      cfg.JWTSecret,
+		TokenTTL:       cfg.TokenTTL,
+		WorkerAPIURL:   cfg.WorkerAPIURL,
+		WorkerAPIToken: cfg.WorkerAPIToken,
+		WorkerTimeout:  time.Duration(cfg.WorkerTimeoutSecs) * time.Second,
+		DefaultUserID:  defaultUserID,
 	})
 
 	server := &http.Server{Addr: ":" + cfg.Port, Handler: router}
 
 	go func() {
-		log.Printf("server running on http://localhost:%s", cfg.Port)
+		log.Printf("api running on http://localhost:%s", cfg.Port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("server error: %v", err)
 		}
@@ -61,7 +64,7 @@ func main() {
 	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
 	<-shutdown
 
-	log.Println("shutting down...")
+	log.Println("shutting down api...")
 	ctxTimeout, cancelTimeout := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelTimeout()
 	if err := server.Shutdown(ctxTimeout); err != nil {

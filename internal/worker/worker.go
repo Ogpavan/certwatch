@@ -31,7 +31,9 @@ type runTracker struct {
 }
 
 func newRunTracker() *runTracker {
-	return &runTracker{}
+	tracker := &runTracker{}
+	tracker.wg.Add(1)
+	return tracker
 }
 
 func (t *runTracker) addJob() {
@@ -46,6 +48,10 @@ func (t *runTracker) wait() {
 	t.wg.Wait()
 }
 
+func (t *runTracker) dispatchDone() {
+	t.wg.Done()
+}
+
 type DomainJob struct {
 	ID      int
 	Domain  string
@@ -55,19 +61,30 @@ type DomainJob struct {
 	tracker *runTracker
 }
 
+type scanRequest struct {
+	ctx     context.Context
+	runID   string
+	userIDs []int
+}
+
 type Scheduler struct {
-	DB       *sql.DB
-	Workers  int
-	Interval time.Duration
-	Logger   *log.Logger
-	Emailer  *notifications.EmailSender
-	jobs     chan DomainJob
+	DB                *sql.DB
+	Workers           int
+	Interval          time.Duration
+	Logger            *log.Logger
+	Emailer           *notifications.EmailSender
+	JobQueueSize      int
+	DispatchQueueSize int
+	jobs              chan DomainJob
+	dispatchQueue     chan scanRequest
 
 	progressMu      sync.Mutex
 	progressHistory map[string][]progressEvent
 	runStatus       map[string]bool
 
-	reportMu   sync.Mutex
+	trackerMu   sync.Mutex
+	runTrackers map[string]*runTracker
+	reportMu    sync.Mutex
 	reportByRun map[string]map[int]*scanReport
 }
 
@@ -81,13 +98,23 @@ func (s *Scheduler) Start(ctx context.Context) {
 	if s.Logger == nil {
 		s.Logger = log.Default()
 	}
+	if s.JobQueueSize <= 0 {
+		s.JobQueueSize = maxInt(s.Workers*256, 10000)
+	}
+	if s.DispatchQueueSize <= 0 {
+		s.DispatchQueueSize = maxInt(s.Workers*4, 64)
+	}
 
 	if s.jobs == nil {
-		s.jobs = make(chan DomainJob)
+		s.jobs = make(chan DomainJob, s.JobQueueSize)
+	}
+	if s.dispatchQueue == nil {
+		s.dispatchQueue = make(chan scanRequest, s.DispatchQueueSize)
 	}
 	for i := 0; i < s.Workers; i++ {
 		go s.worker(ctx, s.jobs)
 	}
+	go s.dispatcher(ctx)
 
 	go s.scheduleLoop(ctx)
 
@@ -98,11 +125,10 @@ func (s *Scheduler) Start(ctx context.Context) {
 
 		for {
 			select {
-				case <-ctx.Done():
-					close(s.jobs)
-					return
-				case <-ticker.C:
-					s.runAuto(ctx, nil)
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.runAuto(ctx, nil)
 			}
 		}
 	}()
@@ -154,6 +180,9 @@ func (s *Scheduler) dueUserIDs(now time.Time) ([]int, error) {
 		if err := rows.Scan(&userID, &schedule, &last); err != nil {
 			return nil, err
 		}
+		if last.Valid {
+			last.Time = coerceLocalTime(last.Time)
+		}
 		if shouldRunNow(now, schedule.String, last) {
 			result = append(result, userID)
 		}
@@ -200,6 +229,19 @@ func sameDay(a, b time.Time) bool {
 	return a.Year() == b.Year() && a.YearDay() == b.YearDay()
 }
 
+func coerceLocalTime(value time.Time) time.Time {
+	return time.Date(
+		value.Year(),
+		value.Month(),
+		value.Day(),
+		value.Hour(),
+		value.Minute(),
+		value.Second(),
+		value.Nanosecond(),
+		time.Local,
+	)
+}
+
 func (s *Scheduler) markUsersScanned(userIDs []int, now time.Time) error {
 	for _, id := range userIDs {
 		if _, err := s.DB.Exec(
@@ -218,25 +260,40 @@ func (s *Scheduler) markUsersScanned(userIDs []int, now time.Time) error {
 	return nil
 }
 
-func (s *Scheduler) runOnce(ctx context.Context, runID string, userIDs []int) *runTracker {
-	var tracker *runTracker
-	if runID != "" {
-		tracker = newRunTracker()
-		s.initReport(runID)
-		if !isAutoRunID(runID) {
-			s.resetProgress(runID)
-			s.recordProgress(runID, progressEvent{Status: "started", Message: "Manual scan queued", Timestamp: time.Now()})
+func (s *Scheduler) dispatcher(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case req, ok := <-s.dispatchQueue:
+			if !ok {
+				return
+			}
+			s.dispatchRun(ctx, req)
 		}
+	}
+}
+
+func (s *Scheduler) dispatchRun(parent context.Context, req scanRequest) {
+	tracker := s.trackerForRun(req.runID)
+	if tracker == nil {
+		return
+	}
+	defer tracker.dispatchDone()
+
+	ctx := parent
+	if req.ctx != nil {
+		ctx = req.ctx
 	}
 
 	query := `SELECT d.id, d.domain, d.port, p.user_id
      FROM domains d
      JOIN projects p ON d.project_id=p.id`
 	args := []interface{}{}
-	if len(userIDs) > 0 {
-		placeholders := make([]string, len(userIDs))
-		for i, id := range userIDs {
-			placeholders[i] = fmt.Sprintf("@u%d", i+1)
+	if len(req.userIDs) > 0 {
+		placeholders := make([]string, len(req.userIDs))
+		for i, id := range req.userIDs {
+			placeholders[i] = fmt.Sprintf("@p%d", i+1)
 			args = append(args, id)
 		}
 		query += " WHERE p.user_id IN (" + strings.Join(placeholders, ",") + ")"
@@ -244,7 +301,10 @@ func (s *Scheduler) runOnce(ctx context.Context, runID string, userIDs []int) *r
 	rows, err := s.DB.Query(query, args...)
 	if err != nil {
 		s.Logger.Printf("scanner: failed to load domains: %v", err)
-		return tracker
+		if req.runID != "" && !isAutoRunID(req.runID) {
+			s.recordProgress(req.runID, progressEvent{Status: "error", Message: "failed to load domains", Timestamp: time.Now()})
+		}
+		return
 	}
 	defer rows.Close()
 
@@ -256,17 +316,65 @@ func (s *Scheduler) runOnce(ctx context.Context, runID string, userIDs []int) *r
 			continue
 		}
 
+		if tracker != nil {
+			tracker.addJob()
+		}
+
 		select {
 		case <-ctx.Done():
-			return tracker
-		case s.jobs <- DomainJob{ID: id, Domain: domain, Port: port, UserID: userID, RunID: runID, tracker: tracker}:
 			if tracker != nil {
-				tracker.addJob()
+				tracker.done()
 			}
+			return
+		case s.jobs <- DomainJob{ID: id, Domain: domain, Port: port, UserID: userID, RunID: req.runID, tracker: tracker}:
+		}
+	}
+	if err := rows.Err(); err != nil && s.Logger != nil {
+		s.Logger.Printf("scanner: rows iteration failed: %v", err)
+		if req.runID != "" && !isAutoRunID(req.runID) {
+			s.recordProgress(req.runID, progressEvent{Status: "error", Message: "domain iteration failed", Timestamp: time.Now()})
+		}
+	}
+}
+
+func (s *Scheduler) queueRun(ctx context.Context, runID string, userIDs []int) (*runTracker, error) {
+	if s.dispatchQueue == nil {
+		return nil, errors.New("scanner not started")
+	}
+
+	var tracker *runTracker
+	if runID != "" {
+		tracker = newRunTracker()
+		s.storeTracker(runID, tracker)
+		s.initReport(runID)
+		if !isAutoRunID(runID) {
+			s.resetProgress(runID)
+			s.recordProgress(runID, progressEvent{Status: "accepted", Message: "scan request accepted", Timestamp: time.Now()})
 		}
 	}
 
-	return tracker
+	req := scanRequest{
+		runID:   runID,
+		userIDs: append([]int(nil), userIDs...),
+	}
+
+	select {
+	case <-ctx.Done():
+		if tracker != nil {
+			s.deleteTracker(runID)
+		}
+		return nil, ctx.Err()
+	case s.dispatchQueue <- req:
+		if runID != "" && !isAutoRunID(runID) {
+			s.recordProgress(runID, progressEvent{Status: "queued", Message: "scan queued for dispatch", Timestamp: time.Now()})
+		}
+		return tracker, nil
+	default:
+		if tracker != nil {
+			s.deleteTracker(runID)
+		}
+		return nil, errors.New("scan queue is full")
+	}
 }
 
 func (s *Scheduler) worker(ctx context.Context, jobs <-chan DomainJob) {
@@ -320,6 +428,10 @@ func (s *Scheduler) worker(ctx context.Context, jobs <-chan DomainJob) {
 					Status:       result.Status,
 					SSLExpiry:    result.SSLExpiry,
 					DomainExpiry: result.DomainExpiry,
+					IPAddress:    result.IPAddress,
+					Issuer:       result.Issuer,
+					IssuerDN:     result.IssuerDN,
+					TLSVersion:   result.TLSVersion,
 					Error:        result.Error,
 				})
 			}
@@ -372,7 +484,6 @@ func (s *Scheduler) generateAlerts(domainID int, domain string, port int, result
 			}
 			if created {
 				s.logEvent(domainID, "WARN", fmt.Sprintf("SSL alert created for %s: %s", domain, message))
-				s.sendEmailIfEnabled(domainID, settings, domain, port, daysLeft, threshold, result, isExpired)
 			}
 		}
 	}
@@ -476,79 +587,6 @@ func (s *Scheduler) loadNotificationSettings(domainID int) (notificationSettings
 	}, nil
 }
 
-func (s *Scheduler) sendEmailIfEnabled(domainID int, settings notificationSettings, domain string, port int, daysLeft, threshold int, result scanner.Result, isExpired bool) {
-	if s.Emailer == nil || !s.Emailer.Enabled() {
-		return
-	}
-	if !settings.EmailEnabled || len(settings.EmailRecipients) == 0 {
-		return
-	}
-	subject := fmt.Sprintf("[CAUTION] SSL expiry alert: %s (%d days left)", domain, daysLeft)
-	if isExpired {
-		subject = fmt.Sprintf("[CAUTION] SSL expired: %s", domain)
-	}
-	dateLine := "-"
-	if result.SSLExpiry != nil {
-		dateLine = result.SSLExpiry.Format("2006-01-02")
-	}
-	domainExpiryLine := "-"
-	if result.DomainExpiry != nil {
-		domainExpiryLine = result.DomainExpiry.Format("2006-01-02")
-	}
-	nameservers := "-"
-	if len(result.Nameservers) > 0 {
-		nameservers = strings.Join(result.Nameservers, ", ")
-	}
-	status := result.Status
-	if status == "" {
-		status = "-"
-	}
-	issuer := result.Issuer
-	if issuer == "" {
-		issuer = "-"
-	}
-	issuerDN := result.IssuerDN
-	if issuerDN == "" {
-		issuerDN = "-"
-	}
-	tlsVersion := result.TLSVersion
-	if tlsVersion == "" {
-		tlsVersion = "-"
-	}
-	ipAddress := result.IPAddress
-	if ipAddress == "" {
-		ipAddress = "-"
-	}
-	scanTime := time.Now().UTC().Format(time.RFC3339)
-	body := strings.Builder{}
-	body.WriteString("SSL expiry alert\n")
-	body.WriteString("\n")
-	body.WriteString(fmt.Sprintf("Domain: %s\n", domain))
-	body.WriteString(fmt.Sprintf("Port: %d\n", port))
-	body.WriteString(fmt.Sprintf("Status: %s\n", status))
-	body.WriteString(fmt.Sprintf("SSL expiry date: %s\n", dateLine))
-	body.WriteString(fmt.Sprintf("Days left: %d\n", daysLeft))
-	body.WriteString(fmt.Sprintf("Threshold: %d days\n", threshold))
-	body.WriteString(fmt.Sprintf("TLS version: %s\n", tlsVersion))
-	body.WriteString(fmt.Sprintf("Issuer: %s\n", issuer))
-	body.WriteString(fmt.Sprintf("Issuer DN: %s\n", issuerDN))
-	body.WriteString(fmt.Sprintf("IP address: %s\n", ipAddress))
-	body.WriteString(fmt.Sprintf("Nameservers: %s\n", nameservers))
-	body.WriteString(fmt.Sprintf("Domain expiry date: %s\n", domainExpiryLine))
-	body.WriteString(fmt.Sprintf("Scan time (UTC): %s\n", scanTime))
-	body.WriteString("\n")
-	body.WriteString("This alert was generated automatically.")
-
-	if err := s.Emailer.Send(settings.EmailRecipients, subject, body.String()); err != nil {
-		if s.Logger != nil {
-			s.Logger.Printf("email: failed to send alert for %s: %v", domain, err)
-		}
-		s.logEvent(domainID, "ERROR", fmt.Sprintf("Email failed for %s: %v", domain, err))
-		return
-	}
-	s.logEvent(domainID, "INFO", fmt.Sprintf("Email sent for %s to %d recipient(s)", domain, len(settings.EmailRecipients)))
-}
-
 func defaultNotifyDays() []int {
 	return []int{30, 14, 7, 3}
 }
@@ -627,10 +665,10 @@ func (s *Scheduler) userIDForDomain(domainID int) (int, error) {
 }
 
 func (s *Scheduler) ScanNow(ctx context.Context, runID string) error {
-	if s.jobs == nil {
-		return errors.New("scanner not started")
+	tracker, err := s.queueRun(ctx, runID, nil)
+	if err != nil {
+		return err
 	}
-	tracker := s.runOnce(ctx, runID, nil)
 	go func() {
 		s.finishRun(runID, tracker, true)
 	}()
@@ -698,6 +736,10 @@ type scanSummary struct {
 	Status       string
 	SSLExpiry    *time.Time
 	DomainExpiry *time.Time
+	IPAddress    string
+	Issuer       string
+	IssuerDN     string
+	TLSVersion   string
 	Error        error
 }
 
@@ -705,6 +747,36 @@ type scanReport struct {
 	UserID  int
 	Started time.Time
 	Items   []scanSummary
+}
+
+func (s *Scheduler) trackerForRun(runID string) *runTracker {
+	if runID == "" {
+		return nil
+	}
+	s.trackerMu.Lock()
+	defer s.trackerMu.Unlock()
+	return s.runTrackers[runID]
+}
+
+func (s *Scheduler) storeTracker(runID string, tracker *runTracker) {
+	if runID == "" || tracker == nil {
+		return
+	}
+	s.trackerMu.Lock()
+	defer s.trackerMu.Unlock()
+	if s.runTrackers == nil {
+		s.runTrackers = make(map[string]*runTracker)
+	}
+	s.runTrackers[runID] = tracker
+}
+
+func (s *Scheduler) deleteTracker(runID string) {
+	if runID == "" {
+		return
+	}
+	s.trackerMu.Lock()
+	defer s.trackerMu.Unlock()
+	delete(s.runTrackers, runID)
 }
 
 func (s *Scheduler) initReport(runID string) {
@@ -749,16 +821,43 @@ func (s *Scheduler) appendReport(runID string, userID int, summary scanSummary) 
 func (s *Scheduler) finishRun(runID string, tracker *runTracker, markDone bool) {
 	if tracker != nil {
 		tracker.wait()
+		s.deleteTracker(runID)
 	}
 	if markDone {
 		s.recordProgress(runID, progressEvent{Status: "done", Message: "scan finished", Timestamp: time.Now()})
 		s.markRunDone(runID)
 	}
+	if runID != "" && !isAutoRunID(runID) {
+		s.markManualRunScanned(runID)
+	}
 	s.sendAggregatedReports(runID)
+}
+
+func (s *Scheduler) markManualRunScanned(runID string) {
+	if runID == "" {
+		return
+	}
+	s.reportMu.Lock()
+	runMap := s.reportByRun[runID]
+	s.reportMu.Unlock()
+	if len(runMap) == 0 {
+		return
+	}
+	userIDs := make([]int, 0, len(runMap))
+	for userID := range runMap {
+		userIDs = append(userIDs, userID)
+	}
+	now := time.Now()
+	if err := s.markUsersScanned(userIDs, now); err != nil && s.Logger != nil {
+		s.Logger.Printf("scheduler: failed to mark manual scan as completed: %v", err)
+	}
 }
 
 func (s *Scheduler) sendAggregatedReports(runID string) {
 	if runID == "" {
+		return
+	}
+	if s.Emailer == nil || !s.Emailer.Enabled() {
 		return
 	}
 	s.reportMu.Lock()
@@ -771,6 +870,10 @@ func (s *Scheduler) sendAggregatedReports(runID string) {
 	}
 
 	for userID, report := range runMap {
+		if len(report.Items) == 0 {
+			continue
+		}
+
 		settings, err := s.loadNotificationSettingsForUser(userID)
 		if err != nil {
 			if s.Logger != nil {
@@ -781,30 +884,57 @@ func (s *Scheduler) sendAggregatedReports(runID string) {
 		if !settings.EmailEnabled || len(settings.EmailRecipients) == 0 {
 			continue
 		}
-		if len(report.Items) == 0 {
+
+		expiring := filterExpiring(report.Items, settings.NotifyDays)
+		if len(expiring) == 0 {
 			continue
 		}
 
-		sort.Slice(report.Items, func(i, j int) bool {
-			if report.Items[i].Domain == report.Items[j].Domain {
-				return report.Items[i].Port < report.Items[j].Port
+		sort.Slice(expiring, func(i, j int) bool {
+			if expiring[i].Domain == expiring[j].Domain {
+				return expiring[i].Port < expiring[j].Port
 			}
-			return report.Items[i].Domain < report.Items[j].Domain
+			return expiring[i].Domain < expiring[j].Domain
 		})
 
 		now := time.Now().UTC()
-		body := buildReportHTML(report, settings.NotifyDays, now)
-
-		subject := fmt.Sprintf("[REPORT] Scan completed (%d domains)", len(report.Items))
+		body := buildExpiryEmailHTML(expiring, settings.NotifyDays, now)
+		subject := fmt.Sprintf("[SSL] Expiring certificates (%d)", len(expiring))
 		if err := s.Emailer.SendHTML(settings.EmailRecipients, subject, body); err != nil {
 			if s.Logger != nil {
-				s.Logger.Printf("email: failed to send scan report for user %d: %v", userID, err)
+				s.Logger.Printf("email: failed to send expiry mail for user %d: %v", userID, err)
 			}
 		}
 	}
 }
 
-func buildReportHTML(report *scanReport, thresholds []int, now time.Time) string {
+func filterExpiring(items []scanSummary, thresholds []int) []scanSummary {
+	if len(items) == 0 {
+		return nil
+	}
+	maxThreshold := 0
+	for _, value := range thresholds {
+		if value > maxThreshold {
+			maxThreshold = value
+		}
+	}
+	if maxThreshold <= 0 {
+		return nil
+	}
+	result := make([]scanSummary, 0, len(items))
+	for _, item := range items {
+		if item.SSLExpiry == nil {
+			continue
+		}
+		daysLeft := int(math.Ceil(time.Until(*item.SSLExpiry).Hours() / 24))
+		if daysLeft < 0 || daysLeft <= maxThreshold {
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
+func buildExpiryEmailHTML(items []scanSummary, thresholds []int, now time.Time) string {
 	builder := strings.Builder{}
 	writeLine := func(value string) {
 		builder.WriteString(value)
@@ -814,61 +944,59 @@ func buildReportHTML(report *scanReport, thresholds []int, now time.Time) string
 	writeLine("<!doctype html>")
 	writeLine("<html>")
 	writeLine("<body style=\"margin:0;padding:0;background:#f8fafc;font-family:Arial,Helvetica,sans-serif;color:#0f172a;\">")
-	writeLine("<div style=\"max-width:920px;margin:0 auto;padding:24px;\">")
+	writeLine("<div style=\"max-width:980px;margin:0 auto;padding:24px;\">")
 	writeLine("<div style=\"background:#ffffff;border:1px solid #e2e8f0;border-radius:12px;padding:20px;\">")
-	writeLine("<h2 style=\"margin:0 0 8px 0;font-size:20px;\">Scan report</h2>")
-	writeLine(fmt.Sprintf("<div style=\"font-size:13px;color:#475569;\">Total domains: %d</div>", len(report.Items)))
-	writeLine(fmt.Sprintf("<div style=\"font-size:13px;color:#475569;margin-bottom:16px;\">Completed at (UTC): %s</div>", htmlEscape(now.Format(time.RFC3339))))
+	writeLine("<h2 style=\"margin:0 0 8px 0;font-size:20px;\">SSL expiry summary</h2>")
+	writeLine(fmt.Sprintf("<div style=\"font-size:13px;color:#475569;\">Expiring certificates: %d</div>", len(items)))
+	writeLine(fmt.Sprintf("<div style=\"font-size:13px;color:#475569;margin-bottom:16px;\">Generated at (UTC): %s</div>", htmlEscape(now.Format(time.RFC3339))))
 	writeLine("<table style=\"width:100%;border-collapse:collapse;font-size:13px;\">")
 	writeLine("<thead>")
 	writeLine("<tr style=\"background:#0f172a;color:#f8fafc;\">")
 	writeLine("<th style=\"text-align:left;padding:10px 12px;\">Domain</th>")
-	writeLine("<th style=\"text-align:left;padding:10px 12px;\">Status</th>")
-	writeLine("<th style=\"text-align:left;padding:10px 12px;\">SSL Expiry (Days Left)</th>")
+	writeLine("<th style=\"text-align:left;padding:10px 12px;\">SSL Expiry</th>")
+	writeLine("<th style=\"text-align:left;padding:10px 12px;\">Days Left</th>")
 	writeLine("<th style=\"text-align:left;padding:10px 12px;\">Domain Expiry</th>")
+	writeLine("<th style=\"text-align:left;padding:10px 12px;\">IP Address</th>")
+	writeLine("<th style=\"text-align:left;padding:10px 12px;\">Issuer</th>")
+	writeLine("<th style=\"text-align:left;padding:10px 12px;\">TLS</th>")
 	writeLine("</tr>")
 	writeLine("</thead>")
 	writeLine("<tbody>")
 
-	for _, item := range report.Items {
-		status := item.Status
-		if status == "" {
-			status = "-"
-		}
+	for _, item := range items {
 		name := fmt.Sprintf("%s:%d", item.Domain, item.Port)
-		sslExpiryLine := "-"
-		daysLeft := 0
-		threshold := 0
-		hasSSL := item.SSLExpiry != nil
-		isExpired := false
+		sslExpiry := formatShortDate(item.SSLExpiry)
+		daysLeft := "-"
 		if item.SSLExpiry != nil {
-			daysLeftRaw := int(math.Ceil(time.Until(*item.SSLExpiry).Hours() / 24))
-			if daysLeftRaw < 0 {
-				isExpired = true
-				daysLeft = 0
-			} else {
-				daysLeft = daysLeftRaw
+			daysLeftValue := int(math.Ceil(time.Until(*item.SSLExpiry).Hours() / 24))
+			if daysLeftValue < 0 {
+				daysLeftValue = 0
 			}
-			sslExpiryLine = fmt.Sprintf("%s (%s)", item.SSLExpiry.Format("2006-01-02"), strconv.Itoa(daysLeft))
-			threshold = pickThreshold(thresholds, daysLeft)
+			daysLeft = strconv.Itoa(daysLeftValue)
 		}
-		domainExpiryLine := "-"
-		if item.DomainExpiry != nil {
-			domainExpiryLine = item.DomainExpiry.Format("2006-01-02")
+		domainExpiry := formatShortDate(item.DomainExpiry)
+		ipAddress := valueOrDash(item.IPAddress)
+		issuer := valueOrDash(item.Issuer)
+		if issuer == "-" && item.IssuerDN != "" {
+			issuer = item.IssuerDN
 		}
+		tls := valueOrDash(item.TLSVersion)
 
-		rowColor := rowColorForSSL(daysLeft, threshold, thresholds, hasSSL, isExpired)
+		rowColor := rowColorForExpiry(item.SSLExpiry, thresholds)
 		writeLine(fmt.Sprintf("<tr style=\"background:%s;\">", rowColor))
 		writeLine(fmt.Sprintf("<td style=\"padding:10px 12px;border-bottom:1px solid #e2e8f0;\">%s</td>", htmlEscape(name)))
-		writeLine(fmt.Sprintf("<td style=\"padding:10px 12px;border-bottom:1px solid #e2e8f0;\">%s</td>", htmlEscape(status)))
-		writeLine(fmt.Sprintf("<td style=\"padding:10px 12px;border-bottom:1px solid #e2e8f0;\">%s</td>", htmlEscape(sslExpiryLine)))
-		writeLine(fmt.Sprintf("<td style=\"padding:10px 12px;border-bottom:1px solid #e2e8f0;\">%s</td>", htmlEscape(domainExpiryLine)))
+		writeLine(fmt.Sprintf("<td style=\"padding:10px 12px;border-bottom:1px solid #e2e8f0;\">%s</td>", htmlEscape(sslExpiry)))
+		writeLine(fmt.Sprintf("<td style=\"padding:10px 12px;border-bottom:1px solid #e2e8f0;\">%s</td>", htmlEscape(daysLeft)))
+		writeLine(fmt.Sprintf("<td style=\"padding:10px 12px;border-bottom:1px solid #e2e8f0;\">%s</td>", htmlEscape(domainExpiry)))
+		writeLine(fmt.Sprintf("<td style=\"padding:10px 12px;border-bottom:1px solid #e2e8f0;\">%s</td>", htmlEscape(ipAddress)))
+		writeLine(fmt.Sprintf("<td style=\"padding:10px 12px;border-bottom:1px solid #e2e8f0;\">%s</td>", htmlEscape(issuer)))
+		writeLine(fmt.Sprintf("<td style=\"padding:10px 12px;border-bottom:1px solid #e2e8f0;\">%s</td>", htmlEscape(tls)))
 		writeLine("</tr>")
 	}
 
 	writeLine("</tbody>")
 	writeLine("</table>")
-	writeLine("<div style=\"margin-top:14px;font-size:12px;color:#64748b;\">This report was generated automatically.</div>")
+	writeLine("<div style=\"margin-top:14px;font-size:12px;color:#64748b;\">This email includes only SSL certificates expiring based on your configured notification days.</div>")
 	writeLine("</div>")
 	writeLine("</div>")
 	writeLine("</body>")
@@ -876,30 +1004,39 @@ func buildReportHTML(report *scanReport, thresholds []int, now time.Time) string
 	return builder.String()
 }
 
-func rowColorForSSL(daysLeft, threshold int, thresholds []int, hasSSL bool, isExpired bool) string {
-	if !hasSSL {
+func rowColorForExpiry(sslExpiry *time.Time, thresholds []int) string {
+	if sslExpiry == nil {
 		return "#f1f5f9"
 	}
-	if isExpired || daysLeft <= 0 {
+	daysLeft := int(math.Ceil(time.Until(*sslExpiry).Hours() / 24))
+	if daysLeft < 0 {
 		return "#fecaca"
 	}
-	if len(thresholds) == 0 || threshold == 0 {
+	threshold := pickThreshold(thresholds, daysLeft)
+	if threshold <= 0 {
 		return "#dcfce7"
 	}
-	index := -1
-	for i, value := range thresholds {
-		if value == threshold {
-			index = i
-			break
-		}
-	}
-	if index <= 0 {
+	if threshold <= 3 {
 		return "#fee2e2"
 	}
-	if index == 1 {
+	if threshold <= 7 {
 		return "#ffedd5"
 	}
 	return "#fef9c3"
+}
+
+func formatShortDate(value *time.Time) string {
+	if value == nil {
+		return "-"
+	}
+	return value.Format("02-Jan-2006")
+}
+
+func valueOrDash(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "-"
+	}
+	return value
 }
 
 func htmlEscape(value string) string {
@@ -954,8 +1091,11 @@ func (s *Scheduler) loadNotificationSettingsForUser(userID int) (notificationSet
 
 func (s *Scheduler) runAuto(ctx context.Context, userIDs []int) {
 	runID := fmt.Sprintf("auto-%d", time.Now().UnixNano())
-	tracker := s.runOnce(ctx, runID, userIDs)
-	if tracker == nil {
+	tracker, err := s.queueRun(ctx, runID, userIDs)
+	if err != nil {
+		if s.Logger != nil {
+			s.Logger.Printf("scheduler: failed to queue automatic scan: %v", err)
+		}
 		return
 	}
 	go s.finishRun(runID, tracker, false)
@@ -963,4 +1103,11 @@ func (s *Scheduler) runAuto(ctx context.Context, userIDs []int) {
 
 func isAutoRunID(runID string) bool {
 	return strings.HasPrefix(runID, "auto-")
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

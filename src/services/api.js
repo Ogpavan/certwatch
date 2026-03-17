@@ -1,23 +1,7 @@
-const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8080";
-
-export function getToken() {
-  return localStorage.getItem("auth_token");
-}
-
-export function setToken(token) {
-  localStorage.setItem("auth_token", token);
-}
-
-export function clearToken() {
-  localStorage.removeItem("auth_token");
-}
+const API_BASE = import.meta.env.VITE_API_BASE || "";
 
 async function request(path, options = {}) {
   const headers = new Headers(options.headers || {});
-  const token = getToken();
-  if (token) {
-    headers.set("Authorization", `Bearer ${token}`);
-  }
   if (options.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
@@ -26,10 +10,6 @@ async function request(path, options = {}) {
     ...options,
     headers
   });
-
-  if (response.status === 401) {
-    clearToken();
-  }
 
   const contentType = response.headers.get("content-type") || "";
   let payload = null;
@@ -48,8 +28,6 @@ async function request(path, options = {}) {
 }
 
 export const api = {
-  login: (data) => request("/auth/login", { method: "POST", body: JSON.stringify(data) }),
-  register: (data) => request("/auth/register", { method: "POST", body: JSON.stringify(data) }),
   getProjects: () => request("/projects"),
   createProject: (data) => request("/projects", { method: "POST", body: JSON.stringify(data) }),
   deleteProject: (id) => request(`/projects/${id}`, { method: "DELETE" }),

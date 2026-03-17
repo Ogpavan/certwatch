@@ -196,7 +196,17 @@ func toTimePtr(value sql.NullTime) *time.Time {
   if !value.Valid {
     return nil
   }
-  return &value.Time
+  coerced := time.Date(
+    value.Time.Year(),
+    value.Time.Month(),
+    value.Time.Day(),
+    value.Time.Hour(),
+    value.Time.Minute(),
+    value.Time.Second(),
+    value.Time.Nanosecond(),
+    time.Local,
+  )
+  return &coerced
 }
 
 func defaultScheduleTime() string {

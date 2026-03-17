@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/likexian/whois"
@@ -29,31 +30,75 @@ type Result struct {
 
 func ScanDomain(ctx context.Context, domain string, port int) Result {
 	res := Result{}
-	_ = ctx
+	scanCtx, cancel := withDefaultTimeout(ctx, 12*time.Second)
+	defer cancel()
 
-	ip, err := resolveIP(domain)
-	if err == nil {
-		res.IPAddress = ip
-	}
+	var mu sync.Mutex
+	wg := sync.WaitGroup{}
+	wg.Add(4)
 
-	tlsResult, err := fetchCertificate(ctx, domain, port)
-	if err != nil {
-		res.Error = err
-		res.Status = "No SSL"
-	} else {
+	go func() {
+		defer wg.Done()
+		ip, err := resolveIP(scanCtx, domain)
+		if err == nil && ip != "" {
+			mu.Lock()
+			res.IPAddress = ip
+			mu.Unlock()
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		tlsCtx, cancelTLS := withDefaultTimeout(scanCtx, 8*time.Second)
+		defer cancelTLS()
+		tlsResult, err := fetchCertificate(tlsCtx, domain, port)
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			if res.Error == nil {
+				res.Error = err
+			}
+			if res.Status == "" {
+				res.Status = "No SSL"
+			}
+			return
+		}
 		res.SSLExpiry = tlsResult.SSLExpiry
 		res.Issuer = tlsResult.Issuer
 		res.IssuerDN = tlsResult.IssuerDN
 		res.TLSVersion = tlsResult.TLSVersion
-	}
+	}()
 
-	expiry, err := resolveDomainExpiry(domain)
-	if err == nil {
-		res.DomainExpiry = expiry
-	}
+	go func() {
+		defer wg.Done()
+		expiry, err := resolveDomainExpiry(scanCtx, domain, 6*time.Second)
+		if err == nil {
+			mu.Lock()
+			res.DomainExpiry = expiry
+			mu.Unlock()
+		}
+	}()
 
-	if ns, err := lookupNameservers(ctx, domain); err == nil && len(ns) > 0 {
-		res.Nameservers = ns
+	go func() {
+		defer wg.Done()
+		nsCtx, cancelNS := withDefaultTimeout(scanCtx, 4*time.Second)
+		defer cancelNS()
+		if ns, err := lookupNameservers(nsCtx, domain); err == nil && len(ns) > 0 {
+			mu.Lock()
+			res.Nameservers = ns
+			mu.Unlock()
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-scanCtx.Done():
 	}
 
 	if res.Status == "" {
@@ -84,19 +129,25 @@ type tlsInfo struct {
 }
 
 func fetchCertificate(ctx context.Context, domain string, port int) (tlsInfo, error) {
-	dialer := &net.Dialer{Timeout: 8 * time.Second}
 	address := net.JoinHostPort(domain, intToString(port))
-	conn, err := tls.DialWithDialer(dialer, "tcp", address, &tls.Config{
-		ServerName:         domain,
-		InsecureSkipVerify: true,
-	})
+	dialer := &net.Dialer{}
+	rawConn, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
 		return tlsInfo{}, err
 	}
-	defer conn.Close()
-
+	conn := tls.Client(rawConn, &tls.Config{
+		ServerName:         domain,
+		InsecureSkipVerify: true,
+	})
+	deadline := deadlineFromContext(ctx, 8*time.Second)
+	_ = conn.SetDeadline(deadline)
+	if err := conn.Handshake(); err != nil {
+		_ = conn.Close()
+		return tlsInfo{}, err
+	}
 	state := conn.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
+		_ = conn.Close()
 		return tlsInfo{}, errors.New("no certificate presented")
 	}
 
@@ -110,6 +161,7 @@ func fetchCertificate(ctx context.Context, domain string, port int) (tlsInfo, er
 
 	expiry := cert.NotAfter
 	tlsVersion := tlsVersionName(state.Version)
+	_ = conn.Close()
 	return tlsInfo{
 		SSLExpiry:  &expiry,
 		Issuer:     issuer,
@@ -118,8 +170,9 @@ func fetchCertificate(ctx context.Context, domain string, port int) (tlsInfo, er
 	}, nil
 }
 
-func resolveIP(domain string) (string, error) {
-	ips, err := net.LookupIP(domain)
+func resolveIP(ctx context.Context, domain string) (string, error) {
+	resolver := net.DefaultResolver
+	ips, err := resolver.LookupIP(ctx, "ip", domain)
 	if err != nil || len(ips) == 0 {
 		return "", err
 	}
@@ -131,13 +184,13 @@ func resolveIP(domain string) (string, error) {
 	return ips[0].String(), nil
 }
 
-func resolveDomainExpiry(domain string) (*time.Time, error) {
+func resolveDomainExpiry(ctx context.Context, domain string, timeout time.Duration) (*time.Time, error) {
 	root, err := publicsuffix.EffectiveTLDPlusOne(domain)
 	if err != nil {
 		root = domain
 	}
 
-	raw, err := whois.Whois(root)
+	raw, err := whoisWithTimeout(ctx, root, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -223,7 +276,8 @@ func lookupNameservers(ctx context.Context, domain string) ([]string, error) {
 	}
 
 	// Fallback to Go's DNS lookup for nameservers if nslookup doesn't return any.
-	records, lookupErr := net.LookupNS(domain)
+	resolver := net.DefaultResolver
+	records, lookupErr := resolver.LookupNS(ctx, domain)
 	if lookupErr != nil {
 		return nil, lookupErr
 	}
@@ -231,6 +285,48 @@ func lookupNameservers(ctx context.Context, domain string) ([]string, error) {
 		nameservers = append(nameservers, strings.TrimSuffix(strings.TrimSpace(record.Host), "."))
 	}
 	return uniqueStrings(nameservers), nil
+}
+
+func withDefaultTimeout(ctx context.Context, fallback time.Duration) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		return context.WithTimeout(context.Background(), fallback)
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, fallback)
+}
+
+func deadlineFromContext(ctx context.Context, fallback time.Duration) time.Time {
+	if ctx == nil {
+		return time.Now().Add(fallback)
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		return deadline
+	}
+	return time.Now().Add(fallback)
+}
+
+func whoisWithTimeout(ctx context.Context, domain string, timeout time.Duration) (string, error) {
+	child, cancel := withDefaultTimeout(ctx, timeout)
+	defer cancel()
+
+	type result struct {
+		raw string
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		raw, err := whois.Whois(domain)
+		ch <- result{raw: raw, err: err}
+	}()
+
+	select {
+	case <-child.Done():
+		return "", child.Err()
+	case res := <-ch:
+		return res.raw, res.err
+	}
 }
 
 func parseNameserverOutput(output string) []string {

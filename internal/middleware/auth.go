@@ -8,7 +8,10 @@ import (
   "github.com/gin-gonic/gin"
 )
 
-const userIDKey = "user_id"
+const (
+  userIDKey      = "user_id"
+  defaultUserID  = 1
+)
 
 func AuthMiddleware(secret string) gin.HandlerFunc {
   return func(c *gin.Context) {
@@ -35,13 +38,23 @@ func AuthMiddleware(secret string) gin.HandlerFunc {
   }
 }
 
+func DefaultUserMiddleware(userID int) gin.HandlerFunc {
+  return func(c *gin.Context) {
+    if userID <= 0 {
+      userID = defaultUserID
+    }
+    c.Set(userIDKey, userID)
+    c.Next()
+  }
+}
+
 func GetUserID(c *gin.Context) int {
   value, exists := c.Get(userIDKey)
   if !exists {
-    return 0
+    return defaultUserID
   }
   if id, ok := value.(int); ok {
     return id
   }
-  return 0
+  return defaultUserID
 }
